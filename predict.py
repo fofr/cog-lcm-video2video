@@ -4,20 +4,19 @@ import subprocess
 import glob
 import tarfile
 from typing import List
-from diffusers import DiffusionPipeline
-from pipeline import LatentConsistencyModelImg2ImgPipeline
+from diffusers import AutoPipelineForImage2Image
 from cog import BasePredictor, Input, Path
 from PIL import Image
+
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        self.img2img_pipe = DiffusionPipeline.from_pretrained(
+        self.img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
             "SimianLuo/LCM_Dreamshaper_v7",
-            custom_pipeline=".",
             cache_dir="model_cache",
             safety_checker=None,
-            local_files_only=True
+            local_files_only=True,
         )
 
         self.img2img_pipe.to(torch_device="cuda", torch_dtype=torch.float16)
@@ -32,7 +31,9 @@ class Predictor(BasePredictor):
 
         subprocess.run(command, shell=True, check=True)
         frame_files = sorted(os.listdir("/tmp"))
-        frame_files = [file for file in frame_files if file.endswith('.png') and 'out' in file]
+        frame_files = [
+            file for file in frame_files if file.endswith(".png") and "out" in file
+        ]
 
         print(f"Extracted {len(frame_files)} frames from video")
         return [f"/tmp/{frame_file}" for frame_file in frame_files]
@@ -55,15 +56,21 @@ class Predictor(BasePredictor):
     def images_to_video(self, image_folder_path, output_video_path, fps):
         # Forming the ffmpeg command
         cmd = [
-            'ffmpeg',
-            '-y',  # Overwrite output file if it exists
-            '-framerate', str(fps),  # Set the framerate for the input files
-            '-pattern_type', 'glob',  # Enable pattern matching for filenames
-            '-i', f'{image_folder_path}/out*.png',  # Input files pattern
-            '-c:v', 'libx264',  # Set the codec for video
-            '-pix_fmt', 'yuv420p',  # Set the pixel format
-            '-crf', '17',  # Set the constant rate factor for quality
-            output_video_path  # Output file
+            "ffmpeg",
+            "-y",  # Overwrite output file if it exists
+            "-framerate",
+            str(fps),  # Set the framerate for the input files
+            "-pattern_type",
+            "glob",  # Enable pattern matching for filenames
+            "-i",
+            f"{image_folder_path}/out*.png",  # Input files pattern
+            "-c:v",
+            "libx264",  # Set the codec for video
+            "-pix_fmt",
+            "yuv420p",  # Set the pixel format
+            "-crf",
+            "17",  # Set the constant rate factor for quality
+            output_video_path,  # Output file
         ]
 
         # Run the ffmpeg command
@@ -80,22 +87,20 @@ class Predictor(BasePredictor):
             description="Prompt for video2video",
             default="Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
         ),
-        video: Path = Input(
-            description="Video to split into frames"
-        ),
+        video: Path = Input(description="Video to split into frames"),
         fps: int = Input(
             description="Number of images per second of video, when not exporting all frames",
             default=8,
-            ge=1
+            ge=1,
         ),
         extract_all_frames: bool = Input(
             description="Get every frame of the video. Ignores fps. Slow for large videos.",
-            default=False
+            default=False,
         ),
         max_width: int = Input(
             description="Maximum width of the video. Maintains aspect ratio.",
             default=512,
-            ge=1
+            ge=1,
         ),
         prompt_strength: float = Input(
             description="1.0 corresponds to full destruction of information in video frame",
@@ -116,8 +121,9 @@ class Predictor(BasePredictor):
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
         return_frames: bool = Input(
-            description="Return a tar file with all the frames alongside the video", default=False
-        )
+            description="Return a tar file with all the frames alongside the video",
+            default=False,
+        ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         # Removing all temporary frames
@@ -150,7 +156,7 @@ class Predictor(BasePredictor):
             "guidance_scale": guidance_scale,
             "num_images_per_prompt": 1,
             "lcm_origin_steps": 50,
-            "output_type": "pil"
+            "output_type": "pil",
         }
 
         # Run img2img pipeline on each frame
