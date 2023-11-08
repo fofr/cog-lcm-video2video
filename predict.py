@@ -1,10 +1,13 @@
+import cv2 as cv
 import os
 import torch
 import subprocess
 import glob
 import tarfile
+import numpy as np
 from typing import List
-from diffusers import AutoPipelineForImage2Image
+from diffusers import ControlNetModel, AutoPipelineForImage2Image
+from latent_consistency_controlnet import LatentConsistencyModelPipeline_controlnet
 from cog import BasePredictor, Input, Path
 from PIL import Image
 
@@ -12,6 +15,9 @@ from PIL import Image
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
+        torch_device = "cuda"
+        torch_dtype = torch.float16
+
         self.img2img_pipe = AutoPipelineForImage2Image.from_pretrained(
             "SimianLuo/LCM_Dreamshaper_v7",
             cache_dir="model_cache",
@@ -19,7 +25,29 @@ class Predictor(BasePredictor):
             local_files_only=True,
         )
 
-        self.img2img_pipe.to(torch_device="cuda", torch_dtype=torch.float16)
+        self.img2img_pipe.to(torch_device=torch_device, torch_dtype=torch_dtype)
+
+        controlnet_canny = ControlNetModel.from_pretrained(
+            "lllyasviel/control_v11p_sd15_canny",
+            cache_dir="model_cache",
+            local_files_only=True,
+            torch_dtype=torch_dtype,
+        ).to(torch_device)
+
+        self.img2img_controlnet_pipe = (
+            LatentConsistencyModelPipeline_controlnet.from_pretrained(
+                "SimianLuo/LCM_Dreamshaper_v7",
+                cache_dir="model_cache",
+                safety_checker=None,
+                controlnet=controlnet_canny,
+                local_files_only=True,
+                scheduler=None,
+            )
+        )
+
+        self.img2img_controlnet_pipe.to(
+            torch_device=torch_device, torch_dtype=torch_dtype
+        )
 
     def extract_frames(self, video, fps, extract_all_frames):
         os.makedirs("/tmp", exist_ok=True)
@@ -53,7 +81,7 @@ class Predictor(BasePredictor):
                 img = img.resize((width, height))
                 img.save(frame_path)
 
-    def images_to_video(self, image_folder_path, output_video_path, fps):
+    def images_to_video(self, image_folder_path, output_video_path, fps, prefix="out"):
         # Forming the ffmpeg command
         cmd = [
             "ffmpeg",
@@ -63,7 +91,7 @@ class Predictor(BasePredictor):
             "-pattern_type",
             "glob",  # Enable pattern matching for filenames
             "-i",
-            f"{image_folder_path}/out*.png",  # Input files pattern
+            f"{image_folder_path}/{prefix}*.png",  # Input files pattern
             "-c:v",
             "libx264",  # Set the codec for video
             "-pix_fmt",
@@ -80,6 +108,11 @@ class Predictor(BasePredictor):
         with tarfile.open(tar_path, "w:gz") as tar:
             for frame in frame_paths:
                 tar.add(frame)
+
+    def control_image(self, image, canny_low_threshold, canny_high_threshold):
+        image = np.array(image)
+        canny = cv.Canny(image, canny_low_threshold, canny_high_threshold)
+        return Image.fromarray(canny)
 
     def predict(
         self,
@@ -113,6 +146,40 @@ class Predictor(BasePredictor):
             ge=1,
             le=50,
             default=4,
+        ),
+        use_canny_control_net: bool = Input(
+            description="Use canny edge detection to guide animation",
+            default=True,
+        ),
+        controlnet_conditioning_scale: float = Input(
+            description="Controlnet conditioning scale",
+            ge=0.1,
+            le=4.0,
+            default=2.0,
+        ),
+        control_guidance_start: float = Input(
+            description="Controlnet start",
+            ge=0.0,
+            le=1.0,
+            default=0.0,
+        ),
+        control_guidance_end: float = Input(
+            description="Controlnet end",
+            ge=0.0,
+            le=1.0,
+            default=1.0,
+        ),
+        canny_low_threshold: float = Input(
+            description="Canny low threshold",
+            ge=1,
+            le=255,
+            default=100,
+        ),
+        canny_high_threshold: float = Input(
+            description="Canny high threshold",
+            ge=1,
+            le=255,
+            default=200,
         ),
         guidance_scale: float = Input(
             description="Scale for classifier-free guidance", ge=1, le=20, default=8.0
@@ -159,24 +226,49 @@ class Predictor(BasePredictor):
             "output_type": "pil",
         }
 
-        # Run img2img pipeline on each frame
-        print(f"Running img2img pipeline on each frame")
+        controlnet_args = {
+            "control_guidance_start": control_guidance_start,
+            "control_guidance_end": control_guidance_end,
+            "controlnet_conditioning_scale": controlnet_conditioning_scale,
+        }
+
+        print("Running img2img pipeline on each frame")
         for frame_path in frame_paths:
-            img2img_args["image"] = Image.open(frame_path)
-            result = self.img2img_pipe(**img2img_args).images
+            frame = Image.open(frame_path)
+            img2img_args["image"] = frame
+
+            if use_canny_control_net:
+                control_image = self.control_image(
+                    frame, canny_low_threshold, canny_high_threshold
+                )
+                img2img_args["control_image"] = control_image
+                result = self.img2img_controlnet_pipe(
+                    **img2img_args, **controlnet_args
+                ).images
+            else:
+                result = self.img2img_pipe(**img2img_args).images
             print(f"Saving frame: {frame_path}")
             result[0].save(frame_path)
 
-        # Create a new video from the frames
-        print(f"Creating video from frames")
+            if use_canny_control_net:
+                control_image.save(frame_path.replace("out", "control"))
+
+        print("Creating video from frames")
         video_path = "/tmp/output_video.mp4"
         self.images_to_video("/tmp", video_path, fps)
 
+        paths = [Path(video_path)]
+
+        if use_canny_control_net:
+            control_video_path = "/tmp/control_video.mp4"
+            self.images_to_video("/tmp", control_video_path, fps, prefix="control")
+            paths.append(Path(control_video_path))
+
         # Tar and return all the frames if return_frames is True
         if return_frames:
-            print(f"Tarring and returning all frames")
+            print("Tarring and returning all frames")
             tar_path = "/tmp/frames.tar.gz"
             self.tar_frames(frame_paths, tar_path)
-            return [Path(video_path), Path(tar_path)]
+            paths.append(Path(tar_path))
 
-        return [Path(video_path)]
+        return paths
