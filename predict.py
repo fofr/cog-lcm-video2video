@@ -27,27 +27,19 @@ class Predictor(BasePredictor):
 
         self.img2img_pipe.to(torch_device=torch_device, torch_dtype=torch_dtype)
 
-        controlnet_canny = ControlNetModel.from_pretrained(
+        self.controlnet_canny = ControlNetModel.from_pretrained(
             "lllyasviel/control_v11p_sd15_canny",
             cache_dir="model_cache",
             local_files_only=True,
             torch_dtype=torch_dtype,
         ).to(torch_device)
 
-        self.img2img_controlnet_pipe = (
-            LatentConsistencyModelPipeline_controlnet.from_pretrained(
-                "SimianLuo/LCM_Dreamshaper_v7",
-                cache_dir="model_cache",
-                safety_checker=None,
-                controlnet=controlnet_canny,
-                local_files_only=True,
-                scheduler=None,
-            )
-        )
-
-        self.img2img_controlnet_pipe.to(
-            torch_device=torch_device, torch_dtype=torch_dtype
-        )
+        self.controlnet_monster = ControlNetModel.from_pretrained(
+            "monster-labs/control_v1p_sd15_qrcode_monster",
+            cache_dir="model_cache",
+            torch_dtype=torch_dtype,
+            local_files_only=True,
+        ).to(torch_device)
 
     def extract_frames(self, video, fps, extract_all_frames):
         os.makedirs("/tmp", exist_ok=True)
@@ -147,9 +139,10 @@ class Predictor(BasePredictor):
             le=50,
             default=4,
         ),
-        use_canny_control_net: bool = Input(
-            description="Use canny edge detection to guide animation",
-            default=True,
+        controlnet: str = Input(
+            description="Controlnet to use",
+            choices=["none", "canny", "illusion"],
+            default="none",
         ),
         controlnet_conditioning_scale: float = Input(
             description="Controlnet conditioning scale",
@@ -203,7 +196,6 @@ class Predictor(BasePredictor):
             seed = int.from_bytes(os.urandom(2), "big")
 
         print(f"Using seed: {seed}")
-        torch.manual_seed(seed)
 
         # Extract frames from video
         print(f"Extracting frames from video: {video}")
@@ -222,7 +214,6 @@ class Predictor(BasePredictor):
             "width": width,
             "height": height,
             "guidance_scale": guidance_scale,
-            "num_images_per_prompt": 1,
             "lcm_origin_steps": 50,
             "output_type": "pil",
         }
@@ -233,25 +224,50 @@ class Predictor(BasePredictor):
             "controlnet_conditioning_scale": controlnet_conditioning_scale,
         }
 
-        print("Running img2img pipeline on each frame")
+        if controlnet == "none":
+            print("Running img2img pipeline on each frame")
+        else:
+            print("Running controlnet on each frame")
+            self.img2img_controlnet_pipe = (
+                LatentConsistencyModelPipeline_controlnet.from_pretrained(
+                    "SimianLuo/LCM_Dreamshaper_v7",
+                    cache_dir="model_cache",
+                    safety_checker=None,
+                    local_files_only=True,
+                    controlnet=self.controlnet_canny
+                    if controlnet == "canny"
+                    else self.controlnet_monster,
+                    scheduler=None,
+                )
+            )
+
+            self.img2img_controlnet_pipe.to(
+                torch_device="cuda", torch_dtype=torch.float16
+            )
+
         for frame_path in frame_paths:
             frame = Image.open(frame_path)
             img2img_args["image"] = frame
 
-            if use_canny_control_net:
-                control_image = self.control_image(
-                    frame, canny_low_threshold, canny_high_threshold
-                )
+            if controlnet != 'none':
+                if controlnet == "canny":
+                    control_image = self.control_image(
+                        frame, canny_low_threshold, canny_high_threshold
+                    )
+                else:
+                    control_image = frame
+
                 img2img_args["control_image"] = control_image
                 result = self.img2img_controlnet_pipe(
-                    **img2img_args, **controlnet_args
+                    **img2img_args, **controlnet_args, generator=torch.manual_seed(seed)
                 ).images
             else:
-                result = self.img2img_pipe(**img2img_args).images
+                result = self.img2img_pipe(**img2img_args, generator=torch.manual_seed(seed)).images
+
             print(f"Saving frame: {frame_path}")
             result[0].save(frame_path)
 
-            if use_canny_control_net:
+            if controlnet == "canny":
                 control_image.save(frame_path.replace("out", "control"))
 
         print("Creating video from frames")
@@ -260,7 +276,7 @@ class Predictor(BasePredictor):
 
         paths = [Path(video_path)]
 
-        if use_canny_control_net:
+        if controlnet == "canny":
             control_video_path = "/tmp/control_video.mp4"
             self.images_to_video("/tmp", control_video_path, fps, prefix="control")
             paths.append(Path(control_video_path))
